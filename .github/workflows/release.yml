@@ -7,6 +7,12 @@ on:
 jobs:
   build:
     uses: ./.github/workflows/build.yml
+    # reusable workflow 的权限不能超过调用方，这里必须授予 packages: write，
+    # 否则 release 触发的构建推 ghcr 同样会被拒绝
+    permissions:
+      contents: read
+      actions: read
+      packages: write
     secrets:
       DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
       DOCKER_TOKEN: ${{ secrets.DOCKER_TOKEN }}
@@ -22,6 +28,10 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-latest
+    # 上传 jar 到 Release 需要 contents: write（同样因为 GITHUB_TOKEN 默认只读）
+    permissions:
+      contents: write
+      actions: read
     steps:
       - name: Checkout
         uses: actions/checkout@v4
